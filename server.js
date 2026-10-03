@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -16,16 +17,34 @@ const io = new Server(httpServer, {
 });
 
 const PORT = process.env.PORT || 5000;
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
-// Раздача клиента (статических файлов)
-app.use(express.static(path.join(__dirname, '../client')));
-
-// Fallback на index.html для любых путей (совместимо с Express 5)
-app.use((req, res) => {
-    res.sendFile(path.join(__dirname, '../client/index.html'));
+// Healthcheck для мониторинга и Render
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', uptime: process.uptime(), rooms: Object.keys(rooms).length });
 });
+
+// Раздача клиента (статических файлов, если папка client существует рядом)
+const clientIndexPath = path.join(__dirname, '../client/index.html');
+const clientStaticDir = path.join(__dirname, '../client');
+
+if (fs.existsSync(clientIndexPath)) {
+    app.use(express.static(clientStaticDir));
+    app.use((req, res) => {
+        res.sendFile(clientIndexPath);
+    });
+} else {
+    app.get('/', (req, res) => {
+        res.json({
+            name: "Podcat Game Server",
+            status: "running",
+            websocket: "active",
+            health: "/health"
+        });
+    });
+}
 
 // Игровые данные
 const rooms = {}; // Хранилище всех активных комнат
@@ -79,6 +98,15 @@ const TRASH_RUMORS = [
     (p1, p2) => `💅 @${p1} считает себя роковым соблазнителем, но краш всё ещё думает, что это был пранк.`,
     (p1, p2) => `🚨 Внимание: @${p1} был(а) пойман(а) за гуглением «как очаровать краша без регистрации и смс».`
 ];
+
+function shuffleArray(arr) {
+    const array = [...arr];
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
 
 function getRandomItem(arr) {
     return arr[Math.floor(Math.random() * arr.length)];
@@ -164,6 +192,17 @@ function startAnswerStage(code) {
     io.to(code).emit('answer:progress', { doneCount: 0, totalCount: totalUsers });
 
     startStageTimer(code, ROUND_TIME, () => {
+        // Если кто-то не успел ответить, подставляем забавный ответ по умолчанию
+        Object.keys(room.users).forEach(username => {
+            if (!room.answers[username]) {
+                const assignment = room.assignments[username] || {};
+                room.answers[username] = {
+                    prompt: assignment.prompt || "Программист в лифте",
+                    answer: "Я так засмотрелся(лась) на тебя, что забыл(а) все слова... 😳",
+                    crush: assignment.crush || "Крашу"
+                };
+            }
+        });
         startVotingStage(code);
     });
 }
@@ -175,12 +214,15 @@ function startVotingStage(code) {
 
     room.stage = 'voting';
     
-    room.cards = Object.entries(room.answers).map(([author, data]) => ({
+    const rawCards = Object.entries(room.answers).map(([author, data]) => ({
         author,
         prompt: data.prompt,
         answer: data.answer,
         crush: data.crush || "Крашу"
     }));
+
+    // Перемешиваем карточки случайным образом, чтобы нельзя было угадать автора по порядку подключения/ответа
+    room.cards = shuffleArray(rawCards);
 
     io.to(code).emit('stage:voting', { cards: room.cards });
 
