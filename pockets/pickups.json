@@ -1,0 +1,39 @@
+
+
+
+
+{
+    "pickup": {
+      "code": "qksd",
+      "users": {
+          "Skade": {
+              "text": {
+                  "partOne": "Что если? 1",
+                  "partTwo": "Тогда 1"
+              },
+              "questionOwner": "Topka"
+          },
+          "Topka": {
+              "text": {
+                  "partOne": "Что если? 2",
+                  "partTwo": "Тогда 2"
+              },
+              "questionOwner": "Chappi"
+          },
+          "Chappi": {
+              "text": {
+                  "partOne": "Что если? 3",
+                  "partTwo": "Тогда 3"
+              },
+              "questionOwner": "Ctrl"
+          },
+          "Ctrl": {
+              "text": {
+                  "partOne": "Что если? 4",
+                  "partTwo": "Тогда 4"
+              },
+              "questionOwner": "Skade"
+          }
+      }
+    }
+}
