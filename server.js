@@ -48,8 +48,19 @@ if (fs.existsSync(clientIndexPath)) {
 
 // Игровые данные
 const rooms = {}; // Хранилище всех активных комнат
-const ROUND_TIME = 90; // 90 секунд на каждый этап
+const SELECTION_TIME = 35; // 35 секунд на выбор завязки
+const ANSWER_TIME = 75;    // 75 секунд на написание подката
+const VOTING_TIME = 45;    // 45 секунд на чтение и голосование
 const MAX_ROUNDS = 3;
+
+// Модификаторы раунда (забавные челленджи от PodCat)
+const ROUND_MODIFIERS = [
+    { title: "Обычный флирт", desc: "Разминка! Никаких рамок — включи свой природный Rizz." },
+    { title: "🐱 Кринж-турбо", desc: "Обязательно используй кошачьи звуки или уменьшительные суффиксы (лапки, мур, котик)!" },
+    { title: "💎 Понты на миллиард", desc: "Подкати как криптомиллиардер или мажор: хвастайся несуществующим богатством и яхтами!" },
+    { title: "🥀 Драматичный поэт", desc: "Максимум драмы и тоски: подкати так, будто это последний шанс спасти твою душу!" },
+    { title: "👵 Бабушкин пикап", desc: "Подкати с душевной заботой, как строгая бабушка или сосед по гаражу!" }
+];
 
 const locations = [
     "в лифте", "на похоронах", "в цирке", "в школе", "в больнице", "в тюрьме", 
@@ -151,26 +162,30 @@ function startAnswerStage(code) {
     const users = Object.keys(room.users);
     const n = users.length;
     
-    // Перемешиваем выбранные завязки и раздаем игрокам
-    const selections = Object.entries(room.selections); // [username, text]
+    // БАГФИКС: Гарантированный циклический сдвиг перемешанных игроков.
+    // Ни один игрок НИКОГДА не получит свою собственную завязку, так как (i + 1) % n != i при n >= 2!
+    const shuffledUsers = shuffleArray(users);
     room.assignments = {};
 
-    // Вычисляем крашей с динамическим смещением по раундам
-    // В раунде 1: смещение 1 (или 2), в раунде 2: другое, в раунде 3: третье
     for (let i = 0; i < n; i++) {
-        const user = users[i];
-        const targetSelection = selections[(i + 1) % selections.length] || [user, "Программист В лифте"];
-        
-        let offset = (room.round % (n - 1 || 1)) + 1;
-        let crushIndex = (i + offset) % n;
-        if (users[crushIndex] === user && n > 1) {
-            crushIndex = (i + 1) % n;
-        }
-        const crush = users[crushIndex] || "Красивой незнакомке";
+        const receiver = shuffledUsers[i];
+        const provider = shuffledUsers[(i + 1) % n];
+        const prompt = room.selections[provider] || "Программист В лифте";
 
-        room.assignments[user] = {
-            prompt: targetSelection[1],
-            fromUser: targetSelection[0],
+        // Назначаем краша (не себя) с ротацией по раундам
+        const candidates = users.filter(u => u !== receiver);
+        const lastCrush = room.previousCrushes?.[receiver];
+        let availableCandidates = candidates.filter(u => u !== lastCrush);
+        if (availableCandidates.length === 0) availableCandidates = candidates;
+        
+        const crush = getRandomItem(availableCandidates) || candidates[0] || "Красивой незнакомке";
+        
+        if (!room.previousCrushes) room.previousCrushes = {};
+        room.previousCrushes[receiver] = crush;
+
+        room.assignments[receiver] = {
+            prompt: prompt,
+            fromUser: provider,
             crush: crush,
             isMutual: false
         };
@@ -186,18 +201,32 @@ function startAnswerStage(code) {
         }
     }
 
-    io.to(code).emit('stage:answering', { assignments: room.assignments, round: room.round });
+    // Клиентам отправляем данные БЕЗ поля isMutual, чтобы игроки не могли заранее сговориться
+    const clientAssignments = {};
+    for (const [u, data] of Object.entries(room.assignments)) {
+        clientAssignments[u] = {
+            prompt: data.prompt,
+            fromUser: data.fromUser,
+            crush: data.crush
+        };
+    }
+
+    io.to(code).emit('stage:answering', { 
+        assignments: clientAssignments, 
+        round: room.round,
+        roundModifier: room.roundModifier
+    });
 
     const totalUsers = Object.keys(room.users).length;
     io.to(code).emit('answer:progress', { doneCount: 0, totalCount: totalUsers });
 
-    startStageTimer(code, ROUND_TIME, () => {
+    startStageTimer(code, ANSWER_TIME, () => {
         // Если кто-то не успел ответить, подставляем забавный ответ по умолчанию
         Object.keys(room.users).forEach(username => {
             if (!room.answers[username]) {
                 const assignment = room.assignments[username] || {};
                 room.answers[username] = {
-                    prompt: assignment.prompt || "Программист в лифте",
+                    prompt: assignment.prompt || "Программист В лифте",
                     answer: "Я так засмотрелся(лась) на тебя, что забыл(а) все слова... 😳",
                     crush: assignment.crush || "Крашу"
                 };
@@ -213,6 +242,7 @@ function startVotingStage(code) {
     if (!room) return;
 
     room.stage = 'voting';
+    room.superlikesThisRound = {};
     
     const rawCards = Object.entries(room.answers).map(([author, data]) => ({
         author,
@@ -229,7 +259,7 @@ function startVotingStage(code) {
     const totalUsers = Object.keys(room.users).length;
     io.to(code).emit('vote:progress', { votedCount: 0, totalCount: totalUsers });
 
-    startStageTimer(code, ROUND_TIME, () => {
+    startStageTimer(code, VOTING_TIME, () => {
         finishRound(code);
     });
 }
@@ -244,7 +274,7 @@ function finishRound(code) {
     const dramaEvents = [];
     const users = Object.keys(room.users);
 
-    // 1. Базовый подсчет и проверка бонусов краша
+    // 1. Базовый подсчет, проверка суперлайков и бонусов краша
     users.forEach(author => {
         const assignment = room.assignments[author] || {};
         const crush = assignment.crush;
@@ -255,16 +285,26 @@ function finishRound(code) {
             .map(([voter]) => voter);
 
         voters.forEach(voter => {
+            const isSuper = room.superlikesThisRound && room.superlikesThisRound[voter] === author;
+            const points = isSuper ? 250 : 100;
+
+            if (isSuper) {
+                dramaEvents.push({
+                    type: 'super',
+                    text: `⭐ СУПЕРЛАЙК! @${voter} подарил(а) золотой суперлайк подкату @${author}! (+250 симпатий)`
+                });
+            }
+
             if (voter === crush) {
                 // Краш проголосовал за автора!
-                room.scores[author] = (room.scores[author] || 0) + 250;
+                const crushPoints = isSuper ? 350 : 250;
+                room.scores[author] = (room.scores[author] || 0) + crushPoints;
                 dramaEvents.push({
                     type: 'crush_match',
-                    text: `💖 МЭТЧ! @${crush} выбрал(а) подкат @${author}! (+250 симпатий)`
+                    text: `💖 МЭТЧ! @${crush} выбрал(а) подкат @${author}! (+${crushPoints} симпатий)`
                 });
             } else {
-                // Обычный голос от другого игрока
-                room.scores[author] = (room.scores[author] || 0) + 100;
+                room.scores[author] = (room.scores[author] || 0) + points;
             }
         });
 
@@ -286,11 +326,11 @@ function finishRound(code) {
             processedPairs.add(`${u1}_${u2}`);
             if (room.votes[u1] === u2 && room.votes[u2] === u1) {
                 // Супер-мэтч!
-                room.scores[u1] = (room.scores[u1] || 0) + 100; // Дополнительный бонус к уже полученным 250
-                room.scores[u2] = (room.scores[u2] || 0) + 100;
+                room.scores[u1] = (room.scores[u1] || 0) + 150;
+                room.scores[u2] = (room.scores[u2] || 0) + 150;
                 dramaEvents.push({
                     type: 'super_match',
-                    text: `🔥 СУПЕР-МЭТЧ! @${u1} и @${u2} взаимно покорили друг друга! (+350 симпатий каждому)`
+                    text: `🔥 СУПЕР-МЭТЧ! @${u1} и @${u2} тайно крашили друг друга и выбрали взаимно! (+150 бонус каждому)`
                 });
             }
         }
@@ -302,6 +342,7 @@ function finishRound(code) {
         room.selections = {};
         room.answers = {};
         room.votes = {};
+        room.superlikesThisRound = {};
         
         io.to(code).emit('round:ended', { 
             scores: room.scores, 
@@ -331,6 +372,15 @@ function startSelectionStage(code) {
     room.selections = {};
     room.answers = {};
     room.votes = {};
+    room.superlikesThisRound = {};
+
+    // Выбираем модификатор для раунда
+    if (room.round === 1) {
+        room.roundModifier = ROUND_MODIFIERS[0];
+    } else {
+        const pool = ROUND_MODIFIERS.slice(1);
+        room.roundModifier = getRandomItem(pool);
+    }
 
     // Каждому игроку генерируем по 2 варианта
     const userOptions = {};
@@ -338,12 +388,16 @@ function startSelectionStage(code) {
         userOptions[username] = generateTwoOptions();
     });
 
-    io.to(code).emit('stage:selection', { userOptions, round: room.round });
+    io.to(code).emit('stage:selection', { 
+        userOptions, 
+        round: room.round,
+        roundModifier: room.roundModifier
+    });
 
     const totalUsers = Object.keys(room.users).length;
     io.to(code).emit('selection:progress', { doneCount: 0, totalCount: totalUsers });
 
-    startStageTimer(code, ROUND_TIME, () => {
+    startStageTimer(code, SELECTION_TIME, () => {
         // Заполняем дефолтными значениями, если кто-то не успел
         Object.keys(room.users).forEach(username => {
             if (!room.selections[username]) {
@@ -408,6 +462,9 @@ function joinRoom(socket, code, username) {
             selections: {},
             answers: {},
             votes: {},
+            superlikesUsed: {},
+            superlikesThisRound: {},
+            previousCrushes: {},
             timer: null
         };
     }
@@ -500,16 +557,24 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 3. Игрок проголосовал
-    socket.on('vote:submit', ({ votedAuthor }) => {
+    // 3. Игрок проголосовал (с поддержкой Суперлайка)
+    socket.on('vote:submit', ({ votedAuthor, isSuperlike }) => {
         const { code, username } = socket.data;
         const room = rooms[code];
         if (!room || room.stage !== 'voting') return;
         
-        // Защита от дубликатов
+        // Защита от дубликатов, голосования за себя и некорректных авторов
         if (room.votes[username]) return;
+        if (votedAuthor === username) return;
+        if (!room.users[votedAuthor]) return;
 
         room.votes[username] = votedAuthor;
+
+        if (isSuperlike && !room.superlikesUsed[username]) {
+            room.superlikesUsed[username] = true;
+            if (!room.superlikesThisRound) room.superlikesThisRound = {};
+            room.superlikesThisRound[username] = votedAuthor;
+        }
 
         const votedCount = Object.keys(room.votes).length;
         const totalCount = Object.keys(room.users).length;
@@ -519,6 +584,14 @@ io.on('connection', (socket) => {
         // Если ВСЕ проголосовали — закончить раунд
         if (votedCount === totalCount) {
             finishRound(code);
+        }
+    });
+
+    // 4. Живые эмодзи-реакции на карточки
+    socket.on('vote:react', ({ author, emoji }) => {
+        const { code, username } = socket.data;
+        if (code && rooms[code] && rooms[code].stage === 'voting' && author && emoji) {
+            io.to(code).emit('vote:reaction', { author, emoji, fromUser: username });
         }
     });
 
@@ -532,6 +605,9 @@ io.on('connection', (socket) => {
         room.selections = {};
         room.answers = {};
         room.votes = {};
+        room.superlikesUsed = {};
+        room.superlikesThisRound = {};
+        room.previousCrushes = {};
         if (room.timer) {
             clearInterval(room.timer);
             room.timer = null;
